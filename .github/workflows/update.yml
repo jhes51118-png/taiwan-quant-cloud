@@ -1,0 +1,36 @@
+name: Update official EOD data
+on:
+  workflow_dispatch:
+  schedule:
+    # 22:17 Taiwan time, Monday to Friday. Scheduled GitHub jobs can be delayed.
+    - cron: '17 14 * * 1-5'
+permissions:
+  contents: write
+concurrency:
+  group: official-eod
+  cancel-in-progress: false
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -e .
+      - name: Collect and notify
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/cloud_update.py
+      - name: Persist public official snapshots
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f data/twquant.sqlite3
+          if ! git diff --cached --quiet; then
+            git commit -m 'Update official after-close market snapshot'
+            git push
+          fi
