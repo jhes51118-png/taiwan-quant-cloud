@@ -17,7 +17,7 @@ jobs:
           unzip -q taiwan-quant-cloud.zip -d _bootstrap
           cp -a _bootstrap/taiwan-quant/. ./
           rm -rf _bootstrap
-          rm -f taiwan-quant-cloud.zip .github/workflows/bootstrap.yml
+          rm -f taiwan-quant-cloud.zip .github/workflows/bootstrap.yml .github/workflows/update.yml
       - name: Commit source tree
         shell: bash
         run: |
