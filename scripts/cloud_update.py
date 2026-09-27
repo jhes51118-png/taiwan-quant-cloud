@@ -8,7 +8,9 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-from twquant.ingest import ingest_official
+from twquant.ingest import (ingest_official, ingest_official_financials,
+                            ingest_official_margin, ingest_official_revenue,
+                            ingest_official_tpex_institutions)
 from twquant.sources import HttpClient, SourceError
 from twquant.store import Store
 from twquant.strategies import weekly_recommendations
@@ -36,15 +38,41 @@ def main() -> None:
     taipei = datetime.now(ZoneInfo("Asia/Taipei"))
     successes = 0
     with Store(dbpath) as store:
+        latest_by_market: dict[str, str] = {}
         for market in ("twse", "tpex"):
             try:
                 n = ingest_official(store, http, market)
                 print(f"{market}: {n} official daily rows")
                 successes += n
+                latest_by_market[market] = store.db.execute(
+                    "SELECT MAX(trade_date) FROM prices WHERE source=?",
+                    (f"{market.upper()}/OpenAPI",),
+                ).fetchone()[0]
             except SourceError as exc:
                 print(f"{market}: fetch/schema failed: {exc}")
         if successes == 0:
             raise RuntimeError("No official market snapshot saved; retry scheduled workflow")
+
+        # Supplementary feeds are independent: one schema/network failure must
+        # not discard the verified daily quote snapshot or block other feeds.
+        for market in ("twse", "tpex"):
+            jobs = (
+                ("monthly revenue", lambda m=market: ingest_official_revenue(store, http, m)),
+                ("margin balances", lambda m=market: ingest_official_margin(
+                    store, http, m, latest_quote_date=latest_by_market.get(m))),
+                ("financial metrics", lambda m=market: ingest_official_financials(store, http, m)),
+            )
+            for label, job in jobs:
+                try:
+                    print(f"{market} {label}: {job()} rows")
+                except (SourceError, ValueError) as exc:
+                    print(f"{market} {label}: fetch/schema failed: {exc}")
+        try:
+            print(f"tpex institutions: {ingest_official_tpex_institutions(store, http)} rows")
+        except (SourceError, ValueError) as exc:
+            print(f"tpex institutions: fetch/schema failed: {exc}")
+        print("twse institutions: 需驗證 — no per-stock feed in the current TWSE OpenAPI Swagger")
+
         latest = store.db.execute("SELECT MAX(trade_date) FROM prices WHERE source IN ('TWSE/OpenAPI','TPEX/OpenAPI')").fetchone()[0]
         if taipei.weekday() == 4 and taipei.hour >= 18 and latest == taipei.date().isoformat():
             try:
