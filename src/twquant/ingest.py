@@ -230,6 +230,279 @@ OFFICIAL_FEEDS = {
     "tpex_balance_general": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap07_O_ci",
 }
 
+OFFICIAL_REVENUE_FEEDS = {
+    "twse": "https://openapi.twse.com.tw/v1/opendata/t187ap05_L",
+    "tpex": "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O",
+}
+
+OFFICIAL_MARGIN_FEEDS = {
+    "twse": "https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN",
+    "tpex": "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_balance",
+}
+
+OFFICIAL_TPEX_INSTITUTIONS = (
+    "https://www.tpex.org.tw/openapi/v1/tpex_3insti_daily_trading"
+)
+
+_STATEMENT_KINDS = ("basi", "bd", "ci", "fh", "ins", "mim")
+
+
+def _official_rows(http: HttpClient, url: str, feed: str, *, allow_empty: bool = False) -> list[dict]:
+    rows = http.get_json(url)
+    if not isinstance(rows, list) or (not rows and not allow_empty):
+        raise SourceError(f"Official feed {feed} returned an unexpected response")
+    if any(not isinstance(row, dict) for row in rows):
+        raise SourceError(f"Official feed {feed} contains a non-object row")
+    return rows
+
+
+def _ordinary_code(value: object) -> str | None:
+    code = str(value).strip()
+    return code if len(code) == 4 and code.isdigit() and not code.startswith("0") else None
+
+
+def _roc_year(value: object) -> int:
+    year = int(str(value).strip())
+    return year + 1911 if year < 1911 else year
+
+
+def _month_end(value: object) -> str:
+    raw = str(value).strip()
+    if not raw.isdigit() or len(raw) not in (5, 6):
+        raise SourceError(f"Invalid official revenue period: {raw}")
+    year, month = _roc_year(raw[:-2]), int(raw[-2:])
+    return date(year, month, calendar.monthrange(year, month)[1]).isoformat()
+
+
+def _quarter_end(year: object, quarter: object) -> str:
+    y, q = _roc_year(year), int(str(quarter).strip())
+    if q not in (1, 2, 3, 4):
+        raise SourceError(f"Invalid official statement quarter: {quarter}")
+    month = q * 3
+    return date(y, month, calendar.monthrange(y, month)[1]).isoformat()
+
+
+def _field(row: dict, candidates: tuple[str, ...], *, required: bool = True) -> tuple[object, str]:
+    for key in candidates:
+        if key in row:
+            return row[key], key
+    if required:
+        raise SourceError(f"Official schema changed; missing one of {candidates}")
+    return None, ""
+
+
+def ingest_official_revenue(store: Store, http: HttpClient, market: str) -> int:
+    """Save the latest official monthly revenue snapshot with its report date.
+
+    The official monetary columns are NT$ thousands; storage normalizes them to
+    TWD.  `出表日期` is later than or equal to the company filing time, so using
+    it as published_at is conservative for point-in-time research.
+    """
+    if market not in OFFICIAL_REVENUE_FEEDS:
+        raise ValueError("unknown market")
+    rows = _official_rows(http, OFFICIAL_REVENUE_FEEDS[market], f"{market}_revenue")
+    code_key = "公司代號" if market == "twse" else "公司代號"
+    needed = {"出表日期", "資料年月", code_key, "營業收入-當月營收"}
+    if not needed.issubset(rows[0]):
+        raise SourceError(f"{market} revenue columns need verification: {sorted(needed-set(rows[0]))}")
+    observed = now()
+    values = []
+    for row in rows:
+        code = _ordinary_code(row.get(code_key))
+        if not code:
+            continue
+        revenue = number(row.get("營業收入-當月營收"))
+        # Investment companies can legitimately report negative revenue when
+        # valuation losses exceed operating income (for example TPEx 7777).
+        if revenue is None:
+            raise SourceError(f"Invalid official revenue for {code}")
+        published = iso_date(row["出表日期"])
+        values.append((code, _month_end(row["資料年月"]), int(round(revenue * 1000)),
+                       published, published, observed,
+                       f"{market.upper()}/OpenAPI/monthly_revenue"))
+    return store.upsert("monthly_revenue",
+                        ("code", "period_end", "revenue_twd", "published_at",
+                         "provider_observed_on", "observed_at", "source"), values)
+
+
+def ingest_official_margin(store: Store, http: HttpClient, market: str,
+                           *, latest_quote_date: str | None = None) -> int:
+    """Save official financing/short balances.
+
+    TPEx supplies an explicit report date.  TWSE's documented MI_MARGN schema
+    does not; its date is therefore tied to the latest saved TWSE quote and the
+    source label explicitly retains `date_inferred` (需驗證).
+    """
+    if market not in OFFICIAL_MARGIN_FEEDS:
+        raise ValueError("unknown market")
+    rows = _official_rows(http, OFFICIAL_MARGIN_FEEDS[market], f"{market}_margin")
+    observed = now()
+    if market == "twse":
+        needed = {"股票代號", "融資今日餘額", "融券今日餘額"}
+        code_key, margin_key, short_key = "股票代號", "融資今日餘額", "融券今日餘額"
+        if not latest_quote_date:
+            raise SourceError("TWSE margin date needs the latest verified quote date")
+        source = "TWSE/OpenAPI/margin_balance/date_inferred_需驗證"
+    else:
+        needed = {"Date", "SecuritiesCompanyCode", "MarginPurchaseBalance", "ShortSaleBalance"}
+        code_key, margin_key, short_key = ("SecuritiesCompanyCode", "MarginPurchaseBalance",
+                                           "ShortSaleBalance")
+        source = "TPEX/OpenAPI/margin_balance"
+    if not needed.issubset(rows[0]):
+        raise SourceError(f"{market} margin columns need verification: {sorted(needed-set(rows[0]))}")
+    values = []
+    for row in rows:
+        code = _ordinary_code(row.get(code_key))
+        if not code:
+            continue
+        trade_day = latest_quote_date if market == "twse" else iso_date(row["Date"])
+        margin = number(row.get(margin_key), integer=True)
+        short = number(row.get(short_key), integer=True)
+        if margin is None and short is None:
+            continue
+        if any(value is not None and value < 0 for value in (margin, short)):
+            raise SourceError(f"Invalid official margin balance for {code}")
+        payload = dict(row)
+        if market == "twse":
+            payload["_date_basis"] = "latest verified TWSE quote date; 需驗證"
+        values.append((code, trade_day, margin, short,
+                       json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                       trade_day if market == "tpex" else observed[:10], observed, source))
+    return store.upsert("margin_balances",
+                        ("code", "trade_date", "margin_balance_lots", "short_balance_lots",
+                         "payload", "published_at", "observed_at", "source"), values)
+
+
+def ingest_official_tpex_institutions(store: Store, http: HttpClient) -> int:
+    """Normalize the documented TPEx per-stock three-institution feed."""
+    rows = _official_rows(http, OFFICIAL_TPEX_INSTITUTIONS, "tpex_institutions")
+    pairs = {
+        "foreign": ("ForeignInvestorsIncludeMainlandAreaInvestors-TotalBuy",
+                    "ForeignInvestorsIncludeMainlandAreaInvestors-TotalSell"),
+        "investment_trust": ("SecuritiesInvestmentTrustCompanies-TotalBuy",
+                             "SecuritiesInvestmentTrustCompanies-TotalSell"),
+        "dealer": ("Dealers-TotalBuy", "Dealers-TotalSell"),
+    }
+    needed = {"Date", "SecuritiesCompanyCode"} | {x for pair in pairs.values() for x in pair}
+    if not needed.issubset(rows[0]):
+        raise SourceError(f"TPEx institution columns need verification: {sorted(needed-set(rows[0]))}")
+    observed, values = now(), []
+    for row in rows:
+        code = _ordinary_code(row.get("SecuritiesCompanyCode"))
+        if not code:
+            continue
+        trade_day = iso_date(row["Date"])
+        for institution, (buy_key, sell_key) in pairs.items():
+            buy, sell = number(row[buy_key], integer=True), number(row[sell_key], integer=True)
+            if buy is None or sell is None or min(buy, sell) < 0:
+                raise SourceError(f"Invalid TPEx institutional volume for {code}")
+            values.append((code, trade_day, institution, buy, sell, trade_day, observed,
+                           "TPEX/OpenAPI/three_institutions"))
+    return store.upsert("institutional_flows",
+                        ("code", "trade_date", "institution", "buy_shares", "sell_shares",
+                         "published_at", "observed_at", "source"), values)
+
+
+def _statement_url(market: str, statement: str, kind: str) -> str:
+    if market == "twse":
+        return f"https://openapi.twse.com.tw/v1/opendata/t187ap{'06' if statement == 'income' else '07'}_L_{kind}"
+    if market == "tpex":
+        return f"https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap{'06' if statement == 'income' else '07'}_O_{kind}"
+    raise ValueError("unknown market")
+
+
+def _statement_metrics(row: dict, statement: str) -> list[tuple[str, float, str]]:
+    if statement == "income":
+        definitions = {
+            "is:EPS": (("基本每股盈餘（元）",), 1.0),
+            "is:Revenue": (("營業收入",), 1000.0),
+            "is:GrossProfit": (("營業毛利（毛損）淨額", "營業毛利（毛損）"), 1000.0),
+            "is:IncomeAfterTaxes": (("淨利（淨損）歸屬於母公司業主",
+                                      "淨利（損）歸屬於母公司業主"), 1000.0),
+        }
+    else:
+        definitions = {
+            "bs:EquityAttributableToOwnersOfParent":
+                (("歸屬於母公司業主之權益合計", "歸屬於母公司業主權益合計",
+                  "歸屬於母公司業主之權益"), 1000.0),
+            "bs:Assets": (("資產總計",), 1000.0),
+            "bs:Liabilities": (("負債總計",), 1000.0),
+        }
+    metrics = []
+    for metric, (candidates, multiplier) in definitions.items():
+        raw, original = _field(row, candidates, required=False)
+        value = number(raw)
+        if value is not None:
+            metrics.append((metric, value * multiplier, original))
+    return metrics
+
+
+def _derive_official_financial_metrics(store: Store, observed: str) -> int:
+    rows = store.db.execute(
+        "SELECT code,period_end,metric,value,published_at FROM quarterly_financials "
+        "WHERE source LIKE '%/OpenAPI/financials/%'"
+    ).fetchall()
+    grouped: dict[tuple[str, str], dict[str, tuple[float, str]]] = {}
+    for code, period, metric, value, published in rows:
+        grouped.setdefault((code, period), {})[metric] = (value, published)
+    values = []
+    for (code, period), metrics in grouped.items():
+        revenue, gross = metrics.get("is:Revenue"), metrics.get("is:GrossProfit")
+        income, equity = metrics.get("is:IncomeAfterTaxes"), metrics.get(
+            "bs:EquityAttributableToOwnersOfParent")
+        if revenue and gross and revenue[0] != 0:
+            published = max(revenue[1], gross[1])
+            values.append((code, period, "is:GrossMargin", gross[0] / revenue[0],
+                           "推估毛利率=累計營業毛利/累計營業收入", published, observed,
+                           "DERIVED/OfficialOpenAPI"))
+        if income and equity and equity[0] > 0:
+            quarter = (date.fromisoformat(period).month // 3)
+            published = max(income[1], equity[1])
+            values.append((code, period, "is:ROE", income[0] / equity[0] * 4 / quarter,
+                           "推估年化ROE=累計歸母淨利/期末歸母權益×4/季數", published, observed,
+                           "DERIVED/OfficialOpenAPI"))
+        eps = metrics.get("is:EPS")
+        if eps:
+            quarter = (date.fromisoformat(period).month // 3)
+            values.append((code, period, "is:EPSAnnualized", eps[0] * 4 / quarter,
+                           "推估年化EPS=累計EPS×4/季數", eps[1], observed,
+                           "DERIVED/OfficialOpenAPI"))
+    return store.upsert("quarterly_financials",
+                        ("code", "period_end", "metric", "value", "original_name",
+                         "published_at", "observed_at", "source"), values)
+
+
+def ingest_official_financials(store: Store, http: HttpClient, market: str) -> int:
+    """Save selected PIT-safe fields from every official statement industry schema."""
+    if market not in ("twse", "tpex"):
+        raise ValueError("unknown market")
+    observed, total = now(), 0
+    for statement in ("income", "balance"):
+        for kind in _STATEMENT_KINDS:
+            feed = f"{market}_{statement}_{kind}"
+            rows = _official_rows(http, _statement_url(market, statement, kind), feed,
+                                  allow_empty=True)
+            if not rows:
+                continue
+            values = []
+            for row in rows:
+                code_raw, _ = _field(row, ("公司代號", "SecuritiesCompanyCode"))
+                code = _ordinary_code(code_raw)
+                if not code:
+                    continue
+                year, _ = _field(row, ("年度", "Year"))
+                quarter, _ = _field(row, ("季別", "Season"))
+                report_date, _ = _field(row, ("出表日期", "Date"))
+                period, published = _quarter_end(year, quarter), iso_date(report_date)
+                for metric, value, original in _statement_metrics(row, statement):
+                    values.append((code, period, metric, value, original, published, observed,
+                                   f"{market.upper()}/OpenAPI/financials/{statement}_{kind}"))
+            total += store.upsert("quarterly_financials",
+                                  ("code", "period_end", "metric", "value", "original_name",
+                                   "published_at", "observed_at", "source"), values)
+    total += _derive_official_financial_metrics(store, observed)
+    return total
+
 
 def archive_official_reports(store: Store, http: HttpClient, feeds: list[str]) -> dict[str, int]:
     counts = {}

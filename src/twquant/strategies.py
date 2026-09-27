@@ -59,11 +59,18 @@ def signals(store: Store, strategy: str, *, ma_days: int = 20, top_n: int = 5,
             revenue_rows["momentum"] = revenue_rows.groupby("code").revenue_twd.pct_change(12, fill_method=None)
             revenue = revenue_rows
         momentum = _latest_known(revenue, dates, codes, "momentum")
+        annualized = fin_rows[fin_rows.metric == "is:EPSAnnualized"].rename(
+            columns={"value": "earnings"})
+        earnings = _latest_known(annualized, dates, codes, "earnings")
+        # Personal FinMind imports may contain stand-alone quarterly EPS.  Use
+        # a four-quarter sum only when no official annualized YTD estimate is
+        # available for that stock/date.
         eps = fin_rows[fin_rows.metric == "is:EPS"].copy()
         if not eps.empty:
             eps = eps.sort_values(["code", "period_end"])
-            eps["ttm"] = eps.groupby("code").value.transform(lambda s: s.rolling(4, min_periods=4).sum())
-        ttm = _latest_known(eps, dates, codes, "ttm")
+            eps["ttm"] = eps.groupby("code").value.transform(
+                lambda s: s.rolling(4, min_periods=4).sum())
+        ttm = earnings.combine_first(_latest_known(eps, dates, codes, "ttm"))
         # This is a conservative proxy, not audited TTM ROE.
         roe = fin_rows[fin_rows.metric == "is:ROE"].rename(columns={"value": "roe"})
         known_roe = _latest_known(roe, dates, codes, "roe")
@@ -82,7 +89,7 @@ def signals(store: Store, strategy: str, *, ma_days: int = 20, top_n: int = 5,
         elif strategy == "低本益比＋高 ROE":
             pe = close / ttm.where(ttm > 0)
             rank = (1 / pe).where((known_roe > 0) & (pe > 0) & (pe < 30))
-            explanation = "需已公布四季 EPS 和可核實的 ROE；缺資料的股票不會入選"
+            explanation = "使用已公布資料的年化 EPS／ROE 推估；缺公布日或有效值者不入選"
         elif strategy == "法人連買":
             rank = streak.where(streak == 3) * (close / ma)
             explanation = "近三個有資料日法人淨買超，且各日公布日期已核實"
@@ -91,7 +98,7 @@ def signals(store: Store, strategy: str, *, ma_days: int = 20, top_n: int = 5,
             b = (close / ma - 1).rank(axis=1, pct=True)
             c = (ttm / close).rank(axis=1, pct=True)
             rank = ((a + b + c) / 3).where(a.notna() & b.notna() & c.notna())
-            explanation = "已核實公布日之營收動能、四季 EPS 殖利近似值、均線趨勢等權"
+            explanation = "已核實公布日之營收動能、年化 EPS 殖利近似值、均線趨勢等權"
         else:
             raise ValueError("未知策略")
     selected = rank.rank(axis=1, ascending=False, method="first").le(top_n) & rank.notna()
