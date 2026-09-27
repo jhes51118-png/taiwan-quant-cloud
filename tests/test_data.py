@@ -5,8 +5,12 @@ from datetime import date
 from pathlib import Path
 
 from twquant.cli import import_disclosures
-from twquant.ingest import adjusted_for_stock, ingest_dataset, ingest_stock_info, sync
-from twquant.sources import SourceError, official_snapshot
+from twquant.ingest import (adjusted_for_stock, ingest_dataset,
+                            ingest_official_financials, ingest_official_margin,
+                            ingest_official_revenue,
+                            ingest_official_tpex_institutions,
+                            ingest_stock_info, sync)
+from twquant.sources import SourceError, number, official_snapshot
 from twquant.store import Store
 
 
@@ -101,6 +105,84 @@ class DataLayerTest(unittest.TestCase):
                 return [{"Date": "109/04/08", "Code": "2330"}]
         with self.assertRaises(SourceError):
             official_snapshot(ChangedSchema(), "twse")
+
+    def test_official_missing_quote_dash_variants(self):
+        self.assertIsNone(number("-"))
+        self.assertIsNone(number("--"))
+        self.assertIsNone(number("----"))
+        self.assertEqual(number("1,234", integer=True), 1234)
+
+    def test_official_revenue_uses_report_date_and_twd(self):
+        class FakeHttp:
+            def get_json(self, url):
+                return [{"出表日期": "1150917", "資料年月": "11508",
+                         "公司代號": "2330", "營業收入-當月營收": "514805337"}]
+        self.assertEqual(ingest_official_revenue(self.store, FakeHttp(), "twse"), 1)
+        row = self.store.db.execute(
+            "SELECT period_end,revenue_twd,published_at,source FROM monthly_revenue"
+        ).fetchone()
+        self.assertEqual(tuple(row), ("2026-08-31", 514805337000, "2026-09-17",
+                                      "TWSE/OpenAPI/monthly_revenue"))
+
+    def test_official_margin_and_tpex_institutions(self):
+        class MarginHttp:
+            def get_json(self, url):
+                return [{"股票代號": "2330", "融資今日餘額": "29,707",
+                         "融券今日餘額": "16"}]
+        ingest_official_margin(self.store, MarginHttp(), "twse",
+                               latest_quote_date="2026-09-24")
+        margin = self.store.db.execute(
+            "SELECT trade_date,margin_balance_lots,short_balance_lots,source "
+            "FROM margin_balances"
+        ).fetchone()
+        self.assertEqual(tuple(margin), ("2026-09-24", 29707, 16,
+                         "TWSE/OpenAPI/margin_balance/date_inferred_需驗證"))
+
+        class InstitutionHttp:
+            def get_json(self, url):
+                return [{"Date": "1150924", "SecuritiesCompanyCode": "6488",
+                    "ForeignInvestorsIncludeMainlandAreaInvestors-TotalBuy": "10",
+                    "ForeignInvestorsIncludeMainlandAreaInvestors-TotalSell": "2",
+                    "SecuritiesInvestmentTrustCompanies-TotalBuy": "3",
+                    "SecuritiesInvestmentTrustCompanies-TotalSell": "1",
+                    "Dealers-TotalBuy": "4", "Dealers-TotalSell": "5"}]
+        self.assertEqual(ingest_official_tpex_institutions(
+            self.store, InstitutionHttp()), 3)
+        flows = self.store.db.execute(
+            "SELECT institution,buy_shares,sell_shares,published_at "
+            "FROM institutional_flows ORDER BY institution"
+        ).fetchall()
+        self.assertEqual([tuple(x) for x in flows], [
+            ("dealer", 4, 5, "2026-09-24"),
+            ("foreign", 10, 2, "2026-09-24"),
+            ("investment_trust", 3, 1, "2026-09-24"),
+        ])
+
+    def test_official_financials_and_derived_metrics(self):
+        class FakeHttp:
+            def get_json(self, url):
+                if url.endswith("06_L_ci"):
+                    return [{"出表日期": "1150927", "年度": "115", "季別": "2",
+                             "公司代號": "2330", "營業收入": "200.00",
+                             "營業毛利（毛損）淨額": "100.00",
+                             "淨利（淨損）歸屬於母公司業主": "40.00",
+                             "基本每股盈餘（元）": "2.00"}]
+                if url.endswith("07_L_ci"):
+                    return [{"出表日期": "1150927", "年度": "115", "季別": "2",
+                             "公司代號": "2330", "資產總計": "1000.00",
+                             "負債總計": "600.00",
+                             "歸屬於母公司業主之權益合計": "400.00"}]
+                return []
+        count = ingest_official_financials(self.store, FakeHttp(), "twse")
+        self.assertEqual(count, 10)  # seven source metrics plus three derived metrics
+        metrics = dict(self.store.db.execute(
+            "SELECT metric,value FROM quarterly_financials WHERE code='2330'"))
+        self.assertEqual(metrics["is:Revenue"], 200000)
+        self.assertEqual(metrics["is:GrossMargin"], .5)
+        self.assertEqual(metrics["is:ROE"], .2)
+        self.assertEqual(metrics["is:EPSAnnualized"], 4.0)
+        self.assertTrue(all(r[0] == "2026-09-27" for r in self.store.db.execute(
+            "SELECT published_at FROM quarterly_financials")))
 
 
 if __name__ == "__main__":
