@@ -89,7 +89,11 @@ class Store:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(str(self.path), timeout=30)
+        # Streamlit caches this Store as a process-wide resource and may render
+        # concurrent browser sessions on different worker threads.  SQLite is
+        # safe for these read-heavy accesses when its per-connection thread
+        # guard is disabled; WAL and busy_timeout continue to coordinate I/O.
+        self.db = sqlite3.connect(str(self.path), timeout=30, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA busy_timeout=30000")
         self.db.executescript(DDL)
