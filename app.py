@@ -46,6 +46,20 @@ if page == "資料總覽":
     b.metric("累積交易日", latest[1])
     c.metric("股票代號", latest[2])
     st.write("資料庫每晚由免費 GitHub Actions 更新；排程可能延遲，以上日期是實際保存的交易日。")
+    coverage = []
+    for label, table, period, source_note in (
+        ("月營收", "monthly_revenue", "period_end", "TWSE＋TPEx；官方出表日"),
+        ("季財報", "quarterly_financials", "period_end", "EPS、毛利率、年化 ROE 推估"),
+        ("三大法人", "institutional_flows", "trade_date", "TPEx 官方；TWSE 逐股端點需驗證"),
+        ("融資融券", "margin_balances", "trade_date", "TPEx 有日期；TWSE 日期推定需驗證"),
+    ):
+        row = store.db.execute(
+            f"SELECT MAX({period}),COUNT(DISTINCT code),COUNT(*) FROM {table} "
+            "WHERE source NOT LIKE 'FinMind/%'"
+        ).fetchone()
+        coverage.append({"資料集": label, "最新期間": row[0] or "待更新",
+                         "股票數": row[1], "資料列": row[2], "範圍／注意事項": source_note})
+    st.dataframe(pd.DataFrame(coverage), width="stretch", hide_index=True)
     st.warning("歷史除權息、下市股、漲跌停旗標與公告日期的完整性尚未建立；沒有這些資料時不會宣稱嚴格含息或無偏差回測。")
     st.markdown("資料來源：[TWSE OpenAPI](https://openapi.twse.com.tw/) · [TPEx OpenAPI](https://www.tpex.org.tw/openapi/)。")
 
