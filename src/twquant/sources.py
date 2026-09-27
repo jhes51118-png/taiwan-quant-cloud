@@ -102,7 +102,8 @@ def iso_date(value: Any) -> str:
 
 def number(value: Any, *, integer: bool = False) -> float | int | None:
     s = str(value).replace(",", "").strip() if value is not None else ""
-    if s in ("", "--", "-", "N/A", "None", "nan"):
+    # TWSE/TPEx use variable-length dash strings for unavailable quotes.
+    if s in ("", "N/A", "None", "nan") or (s and set(s) == {"-"}):
         return None
     n = float(s)
     if not (-1e30 < n < 1e30):
